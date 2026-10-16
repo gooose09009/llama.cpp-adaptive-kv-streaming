@@ -1,0 +1,129 @@
+# ==============================================================================
+# 工作流名称: Windows x64 (CUDA 13.1, SM120 for 5070Ti, 全功能官方对齐版)
+#
+# 【本工作流目标】
+#   为搭载 NVIDIA RTX 5070 Ti 显卡与现代高性能 CPU（如 AMD Ryzen 9850X3D）的 Windows
+#   平台，编译具备 Adaptive KV Streaming V2 特性的 llama.cpp 完整服务端与工具集。
+#
+# 【与 llama.cpp 官方主线 Release 的对比与定制区别】
+#   1. [算子与分支必需] 开启 -DGGML_CUDA_FA_ALL_QUANTS=ON：
+#      官方主线 Release 默认不开启全量化 Flash Attention。而本分支运行 Qwen3.8-27B 
+#      的 Adaptive KV Streaming 必须依赖 Q8_0 K / Q4_0 V 混合量化注意力核函数，
+#      未开启此宏启动时会直接抛出 attention admission 失败而崩溃。
+#
+#   2. [架构定制与加速] 指定 -DCMAKE_CUDA_ARCHITECTURES=120：
+#      官方 Release 会同时编译十几种老显卡架构（耗时 30~50 分钟）。此处针对 5070 Ti
+#      的 Blackwell (sm_120) 架构进行专用编译，直接生成原生 SASS 机器码，无运行时 JIT
+#      损耗，且将 CI 编译耗时大幅压缩至约 5~8 分钟。
+#
+#   3. [驱动与工具链避坑] 采用 CUDA 13.1 与 CCCL 3.4.3：
+#      - 适配本地驱动版本（驱动上限支持到 13.2，并避开 CUDA 13.2 编译 llama.cpp 的已知 bug）。
+#      - 遵循官方主线 PR #29792 规范，针对 CUDA < 13.5 显式指定 -DGGML_CUDA_CCCL_VERSION=v3.4.3，
+#        规避老版本 CCCL 中 CUB DeviceTopK 采样的并发竞争条件（Race Condition）。
+#
+#   4. [完全对齐官方全特性]：
+#      - 内置官方原生 WebUI：预先通过 Node.js 24 执行 npm run build 编译 SvelteKit 前端，
+#        由 CMake 将完整 Web 资产直接嵌进 llama-server.exe，启动后浏览器访问即可直接使用。
+#      - CPU 全变体动态加载（榨干 9850X3D）：开启 -DGGML_BACKEND_DL=ON 与 -DGGML_CPU_ALL_VARIANTS=ON，
+#        编译全套包含 AVX2、AVX-512、VBMI、VNNI 的 CPU 后端 DLL，运行时自动匹配最高指令集。
+#      - 官方工具全家桶：打包 llama-server、llama-cli、llama-bench、llama-quantize 等全套工具。
+#      - 绿色便携打包：自动提取 cudart64、cublas64、cublasLt64 等必要运行时 DLL，解压即用。
+# ==============================================================================
+
+name: Build Windows (CUDA 13.1, SM120, Full Aligned with WebUI)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Windows x64 (CUDA 13.1, SM120, Full Tools & WebUI)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # 步骤 1: 编译 WebUI 前端资产，供 llama-server 静态嵌入
+      - name: Setup Node.js (for WebUI)
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Build WebUI
+        shell: cmd
+        run: |
+          cd tools\ui
+          npm ci
+          npm run build
+          cd ..\..
+
+      # 步骤 2: 准备 CUDA 13.1 工具链与 Ninja 构建器
+      - name: Install CUDA Toolkit 13.1
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.1'
+          cuda_arch: 'x64'
+
+      - name: Install Ninja
+        run: |
+          choco install ninja -y
+
+      # 步骤 3: CMake 配置（注入 SM120 专属架构、FA全量化宏、CCCL适配、全CPU动态后端与全套工具）
+      - name: Configure CMake
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=120 ^
+            -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/nvcc.exe" ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
+            -DGGML_NATIVE=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF
+
+      # 步骤 4: 编译所有已启用的目标程序与动态链接库
+      - name: Build all targets
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%
+          cmake --build build --config Release -j %NINJA_JOBS%
+
+      # 步骤 5: 收集二进制、动态库及 CUDA 运行时依赖，打包成便携压缩包
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force
+
+          # 1. 复制所有编译生成的可执行工具（llama-server, llama-cli, llama-bench, llama-quantize 等）
+          Get-ChildItem -Path "build\bin\Release\*.exe" | Copy-Item -Destination "dist\"
+
+          # 2. 复制所有动态链接库（ggml.dll, llama.dll, ggml-cuda.dll，以及面向 9850X3D 等 CPU 的全套 AVX-512 后端）
+          Get-ChildItem -Path "build\bin\Release\*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "dist\"
+
+          # 3. 复制 CUDA 13.1 运行时依赖 DLL（开箱即用，目标机器无需单独安装 CUDA Toolkit）
+          Write-Host "CUDA_PATH is: $env:CUDA_PATH"
+          Get-ChildItem -Path "$env:CUDA_PATH\bin\cudart64_*.dll" | Copy-Item -Destination "dist\"
+          Get-ChildItem -Path "$env:CUDA_PATH\bin\cublas64_*.dll" | Copy-Item -Destination "dist\"
+          Get-ChildItem -Path "$env:CUDA_PATH\bin\cublasLt64_*.dll" | Copy-Item -Destination "dist\"
+
+          # 4. 打包为 zip
+          7z a -snl -tzip llama-adaptive-kv-win-cuda13.1-sm120.zip .\dist\*
+
+      # 步骤 6: 上传构建产物至 GitHub Actions Artifacts
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-adaptive-kv-win-cuda13.1-sm120
+          path: llama-adaptive-kv-win-cuda13.1-sm120.zip
