@@ -114,9 +114,16 @@ jobs:
 
           # 3. 复制 CUDA 13.1 运行时依赖 DLL（开箱即用，目标机器无需单独安装 CUDA Toolkit）
           Write-Host "CUDA_PATH is: $env:CUDA_PATH"
-          Get-ChildItem -Path "$env:CUDA_PATH\bin\cudart64_*.dll" | Copy-Item -Destination "dist\"
-          Get-ChildItem -Path "$env:CUDA_PATH\bin\cublas64_*.dll" | Copy-Item -Destination "dist\"
-          Get-ChildItem -Path "$env:CUDA_PATH\bin\cublasLt64_*.dll" | Copy-Item -Destination "dist\"
+          $cudaDllDirs = @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")
+          foreach ($dir in $cudaDllDirs) {
+              if (Test-Path $dir) {
+                  Get-ChildItem -Path $dir -Filter "cudart64_*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "dist\" -Force
+                  Get-ChildItem -Path $dir -Filter "cublas64_*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "dist\" -Force
+                  Get-ChildItem -Path $dir -Filter "cublasLt64_*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "dist\" -Force
+              }
+          }
+          Write-Host "Files in dist:"
+          Get-ChildItem -Path "dist\" | Select-Object -ExpandProperty Name
 
           # 4. 打包为 zip
           7z a -snl -tzip llama-adaptive-kv-win-cuda13.1-sm120.zip .\dist\*
